@@ -204,7 +204,8 @@ void
 pid_cache_flush(
     vmi_instance_t vmi)
 {
-    g_hash_table_remove_all(vmi->pid_cache);
+	if (vmi->pid_cache)
+		g_hash_table_remove_all(vmi->pid_cache);
     dbprint(VMI_DEBUG_PIDCACHE, "--PID cache flushed\n");
 }
 
@@ -400,7 +401,8 @@ void
 sym_cache_flush(
     vmi_instance_t vmi)
 {
-    g_hash_table_remove_all(vmi->sym_cache);
+    if(vmi->sym_cache)
+		g_hash_table_remove_all(vmi->sym_cache);
     dbprint(VMI_DEBUG_SYMCACHE, "--SYM cache flushed\n");
 }
 
@@ -528,7 +530,8 @@ void
 rva_cache_flush(
     vmi_instance_t vmi)
 {
-    g_hash_table_remove_all(vmi->rva_cache);
+    if(vmi->rva_cache)
+		g_hash_table_remove_all(vmi->rva_cache);
     dbprint(VMI_DEBUG_RVACACHE, "--RVA cache flushed\n");
 }
 
@@ -653,9 +656,10 @@ v2p_cache_flush(
     vmi_instance_t vmi,
     addr_t dtb)
 {
-    if ( ~0ull == dtb )
-        g_hash_table_remove_all(vmi->v2p_cache);
-    else {
+    if ( ~0ull == dtb ) {
+        if(vmi->v2p_cache)
+			g_hash_table_remove_all(vmi->v2p_cache);
+	} else {
         GHashTable *v = g_hash_table_lookup(vmi->v2p_cache, &dtb);
         if ( v )
             g_hash_table_remove_all(v);

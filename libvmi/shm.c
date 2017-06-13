@@ -92,7 +92,8 @@ void
 v2m_cache_destroy(
     vmi_instance_t vmi)
 {
-    g_hash_table_destroy(vmi->v2m_cache);
+    if ( vmi->v2m_cache )
+        g_hash_table_destroy(vmi->v2m_cache);
 }
 
 status_t
@@ -167,7 +168,8 @@ void
 v2m_cache_flush(
     vmi_instance_t vmi)
 {
-    g_hash_table_remove_all(vmi->v2m_cache);
+	if (vmi->v2m_cache)
+		g_hash_table_remove_all(vmi->v2m_cache);
     dbprint(VMI_DEBUG_V2MCACHE, "--v2m cache flushed\n");
 }
 
