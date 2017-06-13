@@ -42,6 +42,9 @@
 #include <glib/gstdio.h>
 #include <libvirt/libvirt.h>
 #include <libvirt/virterror.h>
+#include <json-c/json.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 
 #include "private.h"
 #include "driver/driver_wrapper.h"
@@ -344,9 +347,12 @@ destroy_domain_socket(
         req.address = 0;
         req.length = 0;
         if (kvm->socket_fd) {
-            (void)write(kvm->socket_fd, &req, sizeof(struct request));
+            int len = write(kvm->socket_fd, &req, sizeof(struct request));
             close(kvm->socket_fd);
             kvm->socket_fd = 0;
+            if (len != sizeof(struct request))
+            {
+            }
         }
     }
 }
@@ -369,120 +375,101 @@ test_using_shm_snapshot(
     }
 }
 
-/*
- * set kvm->shm_snapshot_path;
- */
-static char *
-exec_shm_snapshot(
-    vmi_instance_t vmi)
+static int get_json_value(const char * status, int * shm_index, int * shm_id)
 {
-    kvm_instance_t *kvm = kvm_get_instance(vmi);
+    int ret = -1;
+    struct json_object *root = NULL;
+    struct json_object *sub = NULL;
+    struct json_object *value1 = NULL;
+    struct json_object *value2 = NULL;
 
-    // get a random unique path e.g. /dev/shm/[domain name]xxxxxx.
-    char *unique_shm_path = tempnam("/dev/shm", (char *) kvm->libvirt.virDomainGetName(kvm->dom));
+    //{"return":{"shm_index":0,"shm_id":65536},"id":"libvirt-17"}
 
-    if (NULL != unique_shm_path) {
-        char *shm_filename = basename(unique_shm_path);
-        char *query_template = "'{\"execute\": \"snapshot-create\", \"arguments\": {"
-            " \"filename\": \"/%s\"}}'";
-        char *query = (char *) g_malloc0(strlen(query_template) - strlen("%s") + NAME_MAX + 1);
-        if ( !query )
-            return NULL;
-
-        sprintf(query, query_template, shm_filename);
-        kvm->shm_snapshot_path = strdup(shm_filename);
-        free(unique_shm_path);
-        char *output = exec_qmp_cmd(kvm, query);
-        g_free(query);
-        return output;
-    }
-    else {
-        return NULL;
-    }
-}
-
-static status_t
-exec_shm_snapshot_success(
-    char* status)
-{
-    // successful status should like: {"return":2684354560,"id":"libvirt-812"}
-    if (NULL == status) {
-        return VMI_FAILURE;
-    }
-    char *ptr = strcasestr(status, "CommandNotFound");
-    if (NULL == ptr) {
-        uint64_t shm_snapshot_size = strtoul(status + strlen("{\"return\":"), NULL, 0);
-        if (shm_snapshot_size > 0) {
-            //qmp status e.g. : {"return":2684354560,"id":"libvirt-812"}
-            dbprint(VMI_DEBUG_KVM, "--kvm: using shm-snapshot support\n");
-            return VMI_SUCCESS;
-        } else {
-            //qmp status e.g. : {"return":0,"id":"libvirt-812"}
-            errprint ("--kvm: fail to shm-snapshot\n");
-            return VMI_FAILURE;
+    do {
+        root = json_tokener_parse(status);
+        if(!root) {
+            ret = -1;
+            break;
         }
-    }
-    else {
-        //qmp status e.g. : CommandNotFound
-        errprint("--kvm: didn't find shm-snapshot support\n");
-        return VMI_FAILURE;
-    }
+
+        if(!json_object_object_get_ex(root, "return", &sub)) {
+            ret = -2;
+            break;
+        }
+
+        if(!json_object_object_get_ex(sub, "shm_index", &value1)) {
+            ret = -3;
+            break;
+        }
+        *shm_index = json_object_get_int(value1);
+
+        if(!json_object_object_get_ex(sub, "shm_id", &value2)) {
+            ret = -4;
+            break;
+        }
+        *shm_id = json_object_get_int(value2);
+
+        ret = 0;
+
+    } while (0);
+
+    if (root)
+        json_object_put(root);
+    if (sub)
+        json_object_put(sub);
+    if (value1)
+        json_object_put(value1);
+    if (value2)
+        json_object_put(value2);
+
+    return ret;
 }
 
-/*
- * set kvm->shm_snapshot_fd
- * set kvm->shm_snapshot_map
- */
-static status_t
-link_mmap_shm_snapshot_dev(
-    vmi_instance_t vmi)
+#define SHM_INDEX_DIFF 0x1
+
+static int exec_shm_snapshot_create(vmi_instance_t vmi)
 {
+    int ret = VMI_FAILURE;
+
     kvm_instance_t *kvm = kvm_get_instance(vmi);
-    if ((kvm->shm_snapshot_fd = shm_open(kvm->shm_snapshot_path, O_RDONLY, 0)) < 0) {
-        errprint("fail in shm_open %s", kvm->shm_snapshot_path);
-        return VMI_FAILURE;
-    }
-    ftruncate(kvm->shm_snapshot_fd, vmi->max_physical_address);
 
-    /* try memory mapped file I/O */
-    int mmap_flags = (MAP_PRIVATE | MAP_NORESERVE | MAP_POPULATE);
-#ifdef MMAP_HUGETLB // since kernel 2.6.32
-    mmap_flags |= MMAP_HUGETLB;
-#endif // MMAP_HUGETLB
+    char *query = "'{\"execute\": \"snapshot-create\"}'";
 
-    kvm->shm_snapshot_map = mmap(NULL,  // addr
-        vmi->max_physical_address,   // len
-        PROT_READ,   // prot
-        mmap_flags,  // flags
-        kvm->shm_snapshot_fd,    // file descriptor
-        (off_t) 0);  // offset
-    if (MAP_FAILED == kvm->shm_snapshot_map) {
-        perror("Failed to mmap shared memory snapshot dev");
-        return VMI_FAILURE;
+    char *output = exec_qmp_cmd(kvm, query);
+    dbprint(VMI_DEBUG_KVM, "exec_shm_snapshot_create() return : %s\n", output ? output : "NULL");
+    if (output)
+    {
+        int shm_index, shm_id;
+        if(0 == get_json_value(output, &shm_index, &shm_id))
+        {
+            kvm->shm_snapshot_map = shmat(shm_id, NULL, 0);
+            if (kvm->shm_snapshot_map != (void *)-1)
+            {
+                kvm->shm_snapshot_path = g_malloc0(0x80);
+                sprintf(kvm->shm_snapshot_path, "%d", shm_index);
+                kvm->shm_snapshot_fd = shm_id + SHM_INDEX_DIFF;
+                ret = VMI_SUCCESS;
+            }
+        }
+        g_free(output);
     }
-    return VMI_SUCCESS;
+
+    return ret;
 }
 
-/**
- * clear kvm->shm_snapshot_map
- * clear kvm->shm_snapshot_fd
- * clear kvm->shm_snapshot_path
- */
-static status_t
-munmap_unlink_shm_snapshot_dev(
-    kvm_instance_t *kvm, uint64_t mem_size)
+static void exec_shm_snapshot_destroy(kvm_instance_t *kvm)
 {
-    if (kvm->shm_snapshot_map) {
-        (void) munmap(kvm->shm_snapshot_map, mem_size);
-        kvm->shm_snapshot_map = 0;
+    char query[0x80];
+    sprintf(query, 
+        "'{\"execute\": \"snapshot-destroy\", \"arguments\": {\"shm_index\": %s}}'", 
+        kvm->shm_snapshot_path);    //shm_index
+
+    char *output = exec_qmp_cmd(kvm, query);
+    dbprint(VMI_DEBUG_KVM, "exec_shm_snapshot_destroy() return : %s\n", output ? output : "NULL");
+    if (output)
+    {
+        g_free(output);
     }
-    if (kvm->shm_snapshot_fd) {
-        shm_unlink(kvm->shm_snapshot_path);
-        free(kvm->shm_snapshot_path);
-        kvm->shm_snapshot_path = NULL;
-        kvm->shm_snapshot_fd = 0;
-    }
-    return VMI_SUCCESS;
 }
 
 /**
@@ -1075,8 +1062,8 @@ status_t
 kvm_setup_shm_snapshot_mode(
     vmi_instance_t vmi)
 {
-    char *shm_snapshot_status = exec_shm_snapshot(vmi);
-    if (VMI_SUCCESS == exec_shm_snapshot_success(shm_snapshot_status)) {
+    int ret = exec_shm_snapshot_create(vmi);
+    if (VMI_SUCCESS == ret) {
 
         // dump cpu registers
         char *cpu_regs = exec_info_registers(kvm_get_instance(vmi));
@@ -1089,18 +1076,9 @@ kvm_setup_shm_snapshot_mode(
         v2p_cache_flush(vmi, ~0ull);
         v2m_cache_flush(vmi);
         memory_cache_destroy(vmi);
-        memory_cache_init(vmi, kvm_get_memory_shm_snapshot, kvm_release_memory_shm_snapshot,
-                                1);
-
-        if (shm_snapshot_status)
-            free (shm_snapshot_status);
-
-        return link_mmap_shm_snapshot_dev(vmi);
-    } else {
-        if (shm_snapshot_status)
-            free (shm_snapshot_status);
-        return VMI_FAILURE;
+        memory_cache_init(vmi, kvm_get_memory_shm_snapshot, kvm_release_memory_shm_snapshot, 1);
     }
+    return ret;
 }
 
 status_t
@@ -1111,7 +1089,22 @@ kvm_teardown_shm_snapshot_mode(
 
     if (VMI_SUCCESS == test_using_shm_snapshot(kvm)) {
         dbprint(VMI_DEBUG_KVM, "--kvm: teardown KVM shm-snapshot\n");
-        munmap_unlink_shm_snapshot_dev(kvm, vmi->max_physical_address);
+
+        if (kvm->shm_snapshot_map) {
+            shmdt(kvm->shm_snapshot_map);
+            kvm->shm_snapshot_map = 0;
+        }
+
+        if (kvm->shm_snapshot_path) {
+            exec_shm_snapshot_destroy(kvm);
+            g_free(kvm->shm_snapshot_path);
+            kvm->shm_snapshot_path = NULL;
+        }
+
+        if (kvm->shm_snapshot_fd) {
+            kvm->shm_snapshot_fd = 0;
+        }   
+
         if (kvm->shm_snapshot_cpu_regs != NULL) {
             free(kvm->shm_snapshot_cpu_regs);
             kvm->shm_snapshot_cpu_regs = NULL;
@@ -1121,6 +1114,7 @@ kvm_teardown_shm_snapshot_mode(
         sym_cache_flush(vmi);
         rva_cache_flush(vmi);
         v2p_cache_flush(vmi, ~0ull);
+        v2m_cache_flush(vmi);
         memory_cache_destroy(vmi);
     }
     return VMI_SUCCESS;

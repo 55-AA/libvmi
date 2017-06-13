@@ -1,0 +1,804 @@
+diff -ruN a/Makefile.target b/Makefile.target
+--- a/Makefile.target	2013-08-27 23:05:28.000000000 +0800
++++ b/Makefile.target	2017-06-13 14:33:38.584861713 +0800
+@@ -105,7 +105,7 @@
+ #########################################################
+ # System emulator target
+ ifdef CONFIG_SOFTMMU
+-obj-y += arch_init.o cpus.o monitor.o gdbstub.o balloon.o ioport.o
++obj-y += arch_init.o cpus.o monitor.o gdbstub.o balloon.o ioport.o memory-snapshot.o memory-access.o memory-monitor.o
+ obj-y += qtest.o
+ obj-y += hw/
+ obj-$(CONFIG_FDT) += device_tree.o
+diff -ruN a/memory-access.c b/memory-access.c
+--- a/memory-access.c	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-access.c	2017-06-12 11:14:09.877163100 +0800
+@@ -0,0 +1,433 @@
++/*
++ * Access guest physical memory via a domain socket.
++ *
++ * Copyright (C) 2011 Sandia National Laboratories
++ * Author: Bryan D. Payne (bdpayne@acm.org)
++ */
++
++#include "memory-access.h"
++//#include "cpu-all.h"
++#include "qemu-common.h"
++#include "exec/cpu-common.h"
++#include "config.h"
++
++#include <stdlib.h>
++#include <stdio.h>
++#include <string.h>
++#include <pthread.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include <signal.h>
++#include <stdint.h>
++
++#include <sys/wait.h>
++#include <sys/epoll.h>
++#include <errno.h>
++#include <stdint.h>
++#include <fcntl.h>
++
++#define MAX_EVENTS          64
++#define MAX_SESSSION_SLOT   16
++
++struct request{
++    uint8_t type;      // 0 quit, 1 read, 2 write, ... rest reserved
++    uint64_t address;  // address to read from OR write to
++    uint64_t length;   // number of bytes to read OR write
++};
++
++struct session_slot{
++    int slot_init;
++    void * path_array[MAX_SESSSION_SLOT];
++    pthread_mutex_t slot_lock;
++}g_slot = {0};
++
++static uint64_t
++connection_read_memory (uint64_t user_paddr, void *buf, uint64_t user_len)
++{
++    hwaddr paddr = (hwaddr) user_paddr;
++    hwaddr len = (hwaddr) user_len;
++    void *guestmem = cpu_physical_memory_map(paddr, &len, 0);
++    if (!guestmem){
++        return 0;
++    }
++    memcpy(buf, guestmem, len);
++    cpu_physical_memory_unmap(guestmem, len, 0, len);
++
++    return len;
++}
++
++static uint64_t
++connection_write_memory (uint64_t user_paddr, void *buf, uint64_t user_len)
++{
++    hwaddr paddr = (hwaddr) user_paddr;
++    hwaddr len = (hwaddr) user_len;
++    void *guestmem = cpu_physical_memory_map(paddr, &len, 1);
++    if (!guestmem){
++        return 0;
++    }
++    memcpy(guestmem, buf, len);
++    cpu_physical_memory_unmap(guestmem, len, 0, len);
++
++    return len;
++}
++
++static void
++send_success_ack (int connection_fd)
++{
++    uint8_t success = 1;
++    int nbytes = write(connection_fd, &success, 1);
++    if (1 != nbytes){
++        printf("QemuMemoryAccess: failed to send success ack\n");
++    }
++}
++
++static void
++send_fail_ack (int connection_fd)
++{
++    uint8_t fail = 0;
++    int nbytes = write(connection_fd, &fail, 1);
++    if (1 != nbytes){
++        printf("QemuMemoryAccess: failed to send fail ack\n");
++    }
++}
++
++static int  
++connection_handler(int connection_fd)
++{
++    int is_exit = 0;
++    int nbytes;
++    struct request req;
++
++    while (1) {
++        // client request should match the struct request format
++        nbytes = read(connection_fd, &req, sizeof(struct request));
++        if (nbytes != sizeof(struct request)){
++            //printf("QemuMemoryAccess: connection_handler break : %d\n", nbytes);
++            break;
++        }
++        
++        if (req.type == 0){
++            is_exit = 1;
++            // request to quit, goodbye
++            break;
++        }
++        else if (req.type == 1){
++            // request to read
++            char *buf = malloc(req.length + 1);
++            nbytes = connection_read_memory(req.address, buf, req.length);
++            if (nbytes != req.length){
++                // read failure, return failure message
++                buf[req.length] = 0; // set last byte to 0 for failure
++                nbytes = write(connection_fd, buf, 1);
++            }
++            else{
++                // read success, return bytes
++                buf[req.length] = 1; // set last byte to 1 for success
++                nbytes = write(connection_fd, buf, nbytes + 1);
++            }
++            free(buf);
++        }
++        else if (req.type == 2){
++            // request to write
++            void *write_buf = malloc(req.length);
++            nbytes = read(connection_fd, write_buf, req.length);
++            if (nbytes != req.length){
++                // failed reading the message to write
++                send_fail_ack(connection_fd);
++            }
++            else{
++                // do the write
++                nbytes = connection_write_memory(req.address, write_buf, req.length);
++                if (nbytes == req.length){
++                    send_success_ack(connection_fd);
++                }
++                else{
++                    send_fail_ack(connection_fd);
++                }
++            }
++            free(write_buf);
++        }
++        else{
++            // unknown command
++            printf("QemuMemoryAccess: ignoring unknown command (%d)\n", req.type);
++            char buf[4] = {0};
++            nbytes = write(connection_fd, buf, 1);
++        }
++    }
++
++    close(connection_fd);
++    return is_exit;
++}
++
++static void
++setnonblocking(int fd)  
++{
++    int flags;
++
++    flags = fcntl(fd, F_GETFL);
++
++    if (-1 != flags) {
++        flags |= O_NONBLOCK;
++        fcntl(fd, F_SETFL, flags);
++    }
++}
++
++static int
++init_listen(int epoll_fd, const char * path)
++{
++    int retval = 0;
++    int socket_fd = -1;
++    struct epoll_event ev;  
++    struct sockaddr_un address;
++    socklen_t address_len = strlen(path);
++
++    do{
++        socket_fd = socket(PF_UNIX, SOCK_STREAM, 0);
++        if (socket_fd < 0) {
++            printf("QemuMemoryAccess: socket failed\n");
++            retval = -3;
++            break;
++        }
++        setnonblocking(socket_fd);
++
++        unlink(path);
++
++        address.sun_family = AF_UNIX;
++        memcpy(address.sun_path, path, address_len + 1);
++        address_len += sizeof(address.sun_family);
++
++        retval = bind(socket_fd, (struct sockaddr *) &address, address_len);
++        if (0 != retval) {
++            printf("QemuMemoryAccess: bind failed(%d)\n", errno);
++            retval = -4;
++            break;
++        }
++
++        retval = listen(socket_fd, MAX_EVENTS);
++        if (0 != retval) {
++            printf("QemuMemoryAccess: listen failed(%d)\n", errno);
++            retval = -5;
++            break;
++        }
++
++        ev.data.fd = socket_fd;  
++        ev.events = EPOLLIN;
++        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, socket_fd, &ev);
++
++    }while(0);
++
++    if(socket_fd > 0 && retval < 0) {
++        close(socket_fd);
++        socket_fd = -1;
++    }
++
++    return socket_fd;
++}
++
++static int
++insert_slot(void *path, int path_len)
++{
++    int retval = -11;
++    int i;
++
++    if (0 == g_slot.slot_init) {
++        memset(&g_slot, 0, sizeof(g_slot));
++        pthread_mutex_init(&g_slot.slot_lock, NULL);
++        g_slot.slot_init = 1;
++    }
++
++    pthread_mutex_lock(&g_slot.slot_lock);
++    for (i = 0; i < MAX_SESSSION_SLOT; i ++) {
++        if( NULL == g_slot.path_array[i] ) {
++            g_slot.path_array[i] = path;
++            retval = 1;
++            break;
++        } else {
++            if( 0 == memcmp(g_slot.path_array[i], path, path_len) ){
++                retval = 0;
++                break;
++            }
++        }
++    }
++    pthread_mutex_unlock(&g_slot.slot_lock);
++
++    return retval;
++}
++
++static void
++post_exit(void * path)
++{
++    struct request req;
++    struct sockaddr_un address;
++    int socket_fd, ret;
++    socklen_t address_len = strlen(path);
++
++    socket_fd = socket(PF_UNIX, SOCK_STREAM, 0);
++    if (socket_fd < 0)
++        return;
++
++    address.sun_family = AF_UNIX;
++    memcpy(address.sun_path, path, address_len + 1);
++    address_len += sizeof(address.sun_family);
++    memset(&req, 0, sizeof(req));
++
++    ret = connect(socket_fd, (struct sockaddr *) &address, address_len);
++    if ( 0 == ret ) {
++        ret = write(socket_fd, &req, sizeof(req));
++    }
++
++    close(socket_fd);
++}
++
++static void
++remove_slot(void *path)
++{
++    int i, path_len = strlen(path) + 1;
++    void * p = NULL;
++    if (0 == g_slot.slot_init)
++        return;
++
++    pthread_mutex_lock(&g_slot.slot_lock);
++    for (i = 0; i < MAX_SESSSION_SLOT; i ++) {
++        p = g_slot.path_array[i];
++        if( p && 0 == memcmp(p, path, path_len)) {
++            g_slot.path_array[i] = NULL;
++            break;
++        }
++        p = NULL;
++    }
++    pthread_mutex_unlock(&g_slot.slot_lock);
++
++    if(p) {
++        post_exit(p);
++        unlink(p);
++        free(p);
++    }
++}
++
++static void *
++memory_access_thread(void * path)
++{
++    int epoll_fd, listen_fd;
++    int fds;
++    struct epoll_event *events = NULL;
++    int len = 0;
++    int i;
++    int is_exit = 0;
++
++    epoll_fd = epoll_create1(EPOLL_CLOEXEC);
++    if(-1 == epoll_fd) {
++        printf("QemuMemoryAccess: create epoll failed, error:%d(%s)\n", errno, strerror(errno));
++        return NULL;
++    }
++
++    // create & bind listen socket, and add to epoll, set non-blocking
++    listen_fd = init_listen(epoll_fd, path);
++    if(-1 == listen_fd) {
++        close(epoll_fd);
++        return NULL;
++    }
++
++    len = sizeof(struct epoll_event) * MAX_EVENTS;
++    events = (struct epoll_event *)malloc(len);
++    if (events == NULL) {
++        close(epoll_fd);
++        close(listen_fd);
++        return NULL;
++    }
++
++    memset(events, 0, len);
++
++    for (; 0 == is_exit; ) {
++        fds = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
++        if(fds < 0) {
++            if (errno == EINTR)  
++                continue;  
++
++            printf("QemuMemoryAccess: epoll_wait error, error:%d(%s)\n", errno, strerror(errno));
++            break;
++        }
++
++        for(i = 0; i < fds && 0 == is_exit; i++) {
++
++            if (events[i].data.fd == listen_fd) {
++                struct epoll_event ev; 
++                int conn_fd;
++
++                conn_fd = accept(listen_fd, NULL, NULL);
++                if (conn_fd == -1) {
++                    printf("QemuMemoryAccess: accept failed, error:%d(%s)\n", errno, strerror(errno));
++                    continue;
++                }
++                setnonblocking(conn_fd);
++                ev.events = EPOLLIN | EPOLLET;
++                ev.data.fd = conn_fd;
++                if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, conn_fd, &ev) == -1) {
++                    printf("QemuMemoryAccess: epoll_ctl failed, error:%d(%s)\n", errno, strerror(errno));
++                    close(conn_fd);
++                }
++            }
++            else if (events[i].events & EPOLLIN) {
++
++                is_exit = connection_handler(events[i].data.fd);
++                epoll_ctl(epoll_fd, EPOLL_CTL_DEL, events[i].data.fd, &events[i]);
++
++            }
++        }
++    }
++
++    close(epoll_fd);
++    close(listen_fd);
++    free(events);
++    unlink(path);
++    remove_slot(path);
++
++    return NULL;
++}
++
++int
++memory_access_start (const char *path)
++{
++    pthread_t thread;
++    sigset_t set, oldset;
++    int ret, path_len;
++    void *path_copy;
++
++    if(NULL == path) {
++        printf("QemuMemoryAccess: memory_access_start() invalid path\n");
++        return -1;
++    }
++
++    path_len = strlen(path) + 1;
++
++    if ( path_len < 2 || path_len > sizeof(((struct sockaddr_un *)0)->sun_path) ) {
++        printf("QemuMemoryAccess: memory_access_start() invalid path length : %d\n", path_len);
++        return -2;
++    }
++
++    path_copy = malloc(path_len);
++    if(NULL == path_copy) {
++        return -3;
++    }
++
++    memcpy(path_copy, path, path_len);
++
++    ret = insert_slot(path_copy, path_len);
++    if (ret > 0) {
++        // start the thread
++        sigfillset(&set);
++        pthread_sigmask(SIG_SETMASK, &set, &oldset);
++        ret = pthread_create(&thread, NULL, memory_access_thread, path_copy);
++        pthread_sigmask(SIG_SETMASK, &oldset, NULL);
++        if (0 != ret) {
++            remove_slot(path_copy);
++            printf("QemuMemoryAccess: memory_access_start() pthread_create return : %d\n", ret);
++        }
++    } else {
++        free(path_copy);
++    }
++
++    return ret;
++}
+diff -ruN a/memory-access.h b/memory-access.h
+--- a/memory-access.h	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-access.h	2017-06-11 13:06:21.300551600 +0800
+@@ -0,0 +1,8 @@
++/*
++ * Mount guest physical memory using FUSE.
++ *
++ * Copyright (C) 2011 Sandia National Laboratories
++ * Author: Bryan D. Payne (bdpayne@acm.org)
++ */
++
++int memory_access_start (const char *path);
+diff -ruN a/memory-monitor.c b/memory-monitor.c
+--- a/memory-monitor.c	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-monitor.c	2017-06-13 17:24:00.292198500 +0800
+@@ -0,0 +1,36 @@
++
++#include "qapi/qmp/qjson.h"
++#include "qapi/qmp/json-parser.h"
++
++#include "memory-access.h"
++#include "memory-snapshot.h"
++#include "memory-monitor.h"
++
++int qmp_marshal_input_snapshot_create(Monitor *mon, const QDict *qdict, QObject **ret_data)
++{
++	//	const char *filename = qdict_get_str(qdict, "filename");
++	int shm_index;
++	int shm_id = qmp_shm_snapshot_create(&shm_index);
++
++	if (-1 != shm_id)
++	{
++		QObject *obj;
++		obj = qobject_from_jsonf("{'shm_id':%d,'shm_index':%d}", shm_id, shm_index);
++		*ret_data = obj;
++	}
++	return 0;
++}
++
++int qmp_marshal_input_snapshot_destroy(Monitor *mon, const QDict *qdict, QObject **ret_data)
++{
++	int shm_index = qdict_get_int(qdict, "shm_index");
++	qmp_shm_snapshot_destroy(shm_index);
++	return 0;
++}
++
++int do_physical_memory_access(Monitor *mon, const QDict *qdict, QObject **ret_data)
++{
++	const char *path = qdict_get_str(qdict, "path");
++	return memory_access_start(path);
++}
++
+diff -ruN a/memory-monitor.h b/memory-monitor.h
+--- a/memory-monitor.h	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-monitor.h	2017-06-13 14:26:21.255975000 +0800
+@@ -0,0 +1,8 @@
++
++
++int qmp_marshal_input_snapshot_create(Monitor *mon, const QDict *qdict, QObject **ret_data);
++
++int qmp_marshal_input_snapshot_destroy(Monitor *mon, const QDict *qdict, QObject **ret_data);
++
++int do_physical_memory_access(Monitor *mon, const QDict *qdict, QObject **ret_data);
++
+diff -ruN a/memory-snapshot.c b/memory-snapshot.c
+--- a/memory-snapshot.c	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-snapshot.c	2017-06-13 17:10:11.132633841 +0800
+@@ -0,0 +1,170 @@
++/* 
++ * Shared Memory Snapshot via POSIX shared memory
++ *
++ * Copyright (C) 2013
++ * Author: Peter F. Klemperer (klemperer@cmu.edu)
++ */
++
++
++#include "config-host.h"
++
++#include "monitor/monitor.h"
++#include "sysemu/sysemu.h"
++#include "exec/gdbstub.h"
++#include "sysemu/dma.h"
++#include "sysemu/kvm.h"
++#include "qmp-commands.h"
++
++#include "qemu/thread.h"
++#include "sysemu/cpus.h"
++#include "sysemu/qtest.h"
++#include "qemu/main-loop.h"
++#include "qemu/bitmap.h"
++
++#ifndef _WIN32
++#include "qemu/compatfd.h"
++#endif
++
++#ifdef CONFIG_LINUX
++
++#include <sys/mman.h>
++#include <sys/stat.h>        /* For mode constants */
++#include <fcntl.h>           /* For O_* constants */
++                     
++#include <sys/prctl.h>
++
++#include <sys/ipc.h>
++#include <sys/shm.h>
++
++#endif /* CONFIG_LINUX */
++
++#include "memory-snapshot.h"
++
++#define MAX_SHM_SLOT   16
++
++struct shm_slot{
++	int slot_init;
++	uint8_t * shm_ptr_array[MAX_SHM_SLOT];
++	pthread_mutex_t slot_lock;
++}g_shm_slot = {0};
++
++
++static int get_shm_pointer(size_t size, uint8_t ** shm_ptr)
++{
++	int shm_id;
++	struct shmid_ds shmbuf;
++	int current_pid = getpid();
++
++	shm_id = shmget(/*SHM_ID_KEY_START + */current_pid, size, IPC_CREAT|0660);
++
++	if(-1 != shm_id)
++	{
++		*shm_ptr = shmat(shm_id, NULL, 0);
++		if (*shm_ptr == (void *)-1)
++		{
++			*shm_ptr = NULL;
++			shm_id = -1;
++			printf("shmat:(%d)%s.\n", errno, strerror(errno));
++		}
++
++		//auto free when all refence shmdt.
++		shmctl(shm_id, IPC_RMID, &shmbuf);
++	}
++	else
++	{
++		printf("shmget:(%d)%s.\n", errno, strerror(errno));
++	}
++
++	return shm_id;
++}
++
++static int save_shm_ptr(uint8_t * shm_ptr)
++{
++	int i;
++	if (0 == g_shm_slot.slot_init) {
++		memset(&g_shm_slot, 0, sizeof(g_shm_slot));
++		pthread_mutex_init(&g_shm_slot.slot_lock, NULL);
++		g_shm_slot.slot_init = 1;
++	}
++	pthread_mutex_lock(&g_shm_slot.slot_lock);
++	for (i = 0; i < MAX_SHM_SLOT; i ++) 
++	{
++		if (0 == g_shm_slot.shm_ptr_array[i])
++		{
++			g_shm_slot.shm_ptr_array[i] = shm_ptr;
++			break;
++		}
++	}
++	if (i >= MAX_SHM_SLOT)
++		i = -1;	
++	pthread_mutex_unlock(&g_shm_slot.slot_lock);
++
++	return i;
++}
++
++static uint8_t * clear_shm_ptr(int i)
++{
++	uint8_t * shm_ptr = 0;
++
++	if (g_shm_slot.slot_init) 
++	{
++		pthread_mutex_lock(&g_shm_slot.slot_lock);
++		if (i >= 0 && i < MAX_SHM_SLOT)
++		{
++			shm_ptr = g_shm_slot.shm_ptr_array[i];
++			g_shm_slot.shm_ptr_array[i] = 0;
++		}
++		pthread_mutex_unlock(&g_shm_slot.slot_lock);
++	}
++	return shm_ptr;
++}
++
++int qmp_shm_snapshot_create(int * shm_index)
++{
++	RAMBlock *block;
++	int64_t size;
++	int shm_id = -1;
++	uint8_t * shm_ptr;
++	int page_size = 4096;
++
++	if (0 == shm_index)
++		return shm_id;
++	
++	block = QTAILQ_FIRST( &ram_list.blocks );
++	size = memory_region_size(block->mr);
++
++	shm_id = get_shm_pointer(size, &shm_ptr);
++
++	if (-1 != shm_id && shm_ptr)
++	{
++		int64_t addr = 0;
++		while (size != 0) {
++			if (page_size > size)
++				page_size = size;
++
++			// read out memory
++			cpu_physical_memory_rw(addr, shm_ptr + addr, page_size, 0);
++
++			addr += page_size;
++			size -= page_size;
++		}
++
++		*shm_index = save_shm_ptr(shm_ptr);
++		if(*shm_index < 0)
++		{
++			printf("save_shm_ptr err.\n");
++			shmdt(shm_ptr);
++			shm_id = -1;
++		}
++	}
++
++	return shm_id;
++}
++
++void qmp_shm_snapshot_destroy(int shm_index)
++{
++	uint8_t * shm_ptr = clear_shm_ptr(shm_index);
++	if (shm_ptr)
++		shmdt(shm_ptr);
++}
++
+diff -ruN a/memory-snapshot.h b/memory-snapshot.h
+--- a/memory-snapshot.h	1970-01-01 08:00:00.000000000 +0800
++++ b/memory-snapshot.h	2017-06-12 12:14:58.613281400 +0800
+@@ -0,0 +1,17 @@
++/* 
++ * Shared Memory Snapshot via POSIX shared memory
++ *
++ * Copyright (C) 2013
++ * Author: Peter F. Klemperer (klemperer@cmu.edu)
++ */
++#ifndef MEMORY_SNAPSHOT_H
++#define MEMORY_SNAPSHOT_H 1
++
++/* memory-snapshot.c */
++int64_t qmp_snapshot_create(const char *filename);
++void qmp_snapshot_destroy(const char *filename);
++
++int qmp_shm_snapshot_create(int * shm_index);
++void qmp_shm_snapshot_destroy(int shm_index);
++
++#endif /* MEMORY_SNAPSHOT_H */
+diff -ruN a/monitor.c b/monitor.c
+--- a/monitor.c	2013-08-27 23:05:28.000000000 +0800
++++ b/monitor.c	2017-06-13 14:32:09.877829797 +0800
+@@ -74,7 +74,7 @@
+ #include "hw/sparc/sun4m.h"
+ #endif
+ #include "hw/lm32/lm32_pic.h"
+-
++#include "memory-monitor.h"
+ //#define DEBUG
+ //#define DEBUG_COMPLETION
+ 
+diff -ruN a/qmp-commands.hx b/qmp-commands.hx
+--- a/qmp-commands.hx	2013-08-27 23:05:28.000000000 +0800
++++ b/qmp-commands.hx	2017-06-13 17:15:14.609427385 +0800
+@@ -2932,3 +2932,80 @@
+ <- { "return": {} }
+ 
+ EQMP
++
++    {
++        .name       = "pmemaccess",
++        .args_type  = "path:s",
++        .params     = "path",
++        .help       = "mount guest physical memory image at 'path'",
++        .mhandler.cmd_new = do_physical_memory_access,
++    },
++
++SQMP
++pmemaccess
++----------
++
++Mount guest physical memory image at 'path'.
++
++Arguments:
++
++- "path": mount point path
++
++Example:
++
++-> { "execute": "pmemaccess",
++             "arguments": { "path": "/tmp/guestname" } }
++<- { "return": {} }
++
++EQMP
++
++    {
++        .name       = "snapshot-create",
++        .args_type  = "",
++        .help       = "share guest physical memory image",
++        .mhandler.cmd_new = qmp_marshal_input_snapshot_create,
++    },
++
++SQMP
++snapshot-create
++----------
++
++Share guest physical memory image. 
++Returns json result indicating the image.
++
++Arguments:
++
++- None
++
++Example:
++
++-> { "execute": "snapshot-create" }
++<- { "return":{"shm_index":0,"shm_id":65536},"id":"libvirt-17" }
++
++EQMP
++
++    {
++        .name       = "snapshot-destroy",
++        .args_type  = "shm_index:i",
++        .params     = "shm_index",
++        .help       = "destroy shared guest physical memory image at shm_index",
++        .mhandler.cmd_new = qmp_marshal_input_snapshot_destroy,
++    },
++
++SQMP
++snapshot-destroy
++----------
++
++Destroy shared guest physical memory image. 
++
++Arguments:
++
++- "shm_index": returned by snapshot-create
++
++Example:
++
++-> { "execute": "snapshot-destroy",
++             "arguments": { "shm_index": 65536 } }
++<- { "return": {} }
++
++EQMP
